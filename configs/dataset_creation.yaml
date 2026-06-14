@@ -1,0 +1,73 @@
+input_file: "data/extracted_concepts/llm/normalized_concepts.csv"
+output_dir: "data/link_prediction/llm_concept_datasets/"
+
+columns:
+  id: "id"
+  year: "year"
+  concepts: "normalized_concepts"
+  title: "title"
+  abstract: "abstract"
+
+years:
+  min_year: 2017
+  max_year: 2025
+  test_year: 2025
+  val_year: 2024
+
+# Must match data.window_size in model_training.yaml.
+window_size: 5
+
+negative_sampling:
+  seed: 42
+
+  # Train / val — contrastive negatives (one endpoint of the positive is kept as anchor).
+  # strategy: random | biased | smart
+  #   random: uniform replacement node
+  #   biased: degree-proportional replacement node
+  #   smart: 2-hop neighbours of anchor (hard negatives)
+
+  # augmentation_factor > 1: repeats sampling n times with different seeds.
+  # NOTE: deleting existing train.csv / val.csv is required when changing these.
+  contrastive:
+    strategy: "smart"
+    n_neg_per_pos: 100
+    augmentation_factor: 1
+    strategy_weights:
+      "2hop": 0.55
+      "resource_alloc": 0.30
+      "pref_attach": 0.10
+      "random": 0.05
+
+  # Test / ranking — standard global negatives (existing behaviour).
+  test:
+    strategy: "smart"   # Options: smart, popularity_biased, random
+    strategy_weights:
+      "2hop": 0.55
+      "resource_alloc": 0.30
+      "pref_attach": 0.10
+      "random": 0.05
+
+features:
+  # Graph-based (computed per pair from window graph)
+  use_cooccurrence_count: true
+  use_jaccard: true
+  use_adamic_adar: true
+  use_preferential_attachment: true
+  use_common_neighbors: true
+  use_concept_frequency: true
+  use_year_trend: true
+  use_resource_allocation: true
+  use_salton: true
+  use_hub_promoted: true
+  use_hub_suppressed: true
+  use_katz_approx: false   # expensive O(deg^2) per pair; enable only if compute time allows
+  katz_beta: 0.5
+
+  # Sparse matrix features (degree + AA from each year in window)
+  use_sparse_matrix_features: true
+
+  # Embedding features (avg article embedding per concept)
+  use_embedding_features: true
+  embedding_model: "allenai-specter"
+  embedding_batch_size: 256
+  embedding_combination: ["cosine", "l2"]
