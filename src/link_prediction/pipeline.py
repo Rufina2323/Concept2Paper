@@ -18,6 +18,12 @@ from src.link_prediction.load_data import (
     DataSplit,
     GroupedBatchSampler,
     load_datasets,
+    GNNData,
+)
+from src.link_prediction.models.graph_models import (
+    GNNLinkPredictor,
+    GNNTrainer,
+    HAS_TORCH_GEOMETRIC,
 )
 from src.link_prediction.models.boosting_models import (
     LightGBMModel,
@@ -132,6 +138,98 @@ def run_mlp(
             / f"{name.lower().replace(' ', '_').replace('(', '').replace(')', '')}.pt"
         )
         trainer.save(str(save_path), dim, hidden, dropout)
+
+    return result
+
+
+def run_gnn(
+    name: str,
+    gnn_data: GNNData,
+    y_train: np.ndarray,
+    y_val: np.ndarray,
+    y_test: np.ndarray,
+    cfg: Dict[str, Any],
+    rank_k: List[int],
+    model_dir: Optional[Path] = None,
+) -> ModelResult:
+    logger.info("\n%s\n%s\n%s", "═" * 60, name, "═" * 60)
+    result = ModelResult(name=name)
+
+    if not HAS_TORCH_GEOMETRIC:
+        logger.warning("torch_geometric not installed — skipping GNN")
+        return result
+
+    import argparse
+
+    args = argparse.Namespace(
+        num_vertices=gnn_data.num_vertices,
+        num_node_features=gnn_data.num_node_features,
+        embedding_dim=cfg.get("embedding_dim", 64),
+        num_pairwise_features=gnn_data.num_pairwise_features,
+        dnn_hidden_dim=cfg.get("dnn_hidden_dim", 128),
+        gnn_dropout_rate=cfg.get("gnn_dropout_rate", 0.3),
+        dnn_dropout_rate=cfg.get("dnn_dropout_rate", 0.3),
+        edge_dim=getattr(gnn_data, "num_edge_features", None),
+    )
+
+    model = GNNLinkPredictor(args)
+    trainer = GNNTrainer(
+        model,
+        gnn_data.graph,
+        gnn_data.node_features,
+        lr=cfg.get("learning_rate", 0.001),
+        weight_decay=cfg.get("weight_decay", 1e-4),
+        loss=cfg.get("loss", "contrastive"),
+    )
+
+    result.best_epoch = trainer.fit(
+        gnn_data.vertex_pairs["train"],
+        gnn_data.pairwise_features["train"],
+        y_train,
+        gnn_data.vertex_pairs["val"],
+        gnn_data.pairwise_features["val"],
+        y_val,
+        epochs=cfg.get("epochs", 100),
+        patience=cfg.get("patience", 10),
+    )
+
+    for split_name, y in (("train", y_train), ("val", y_val), ("test", y_test)):
+        scores = trainer.predict(
+            gnn_data.vertex_pairs[split_name], gnn_data.pairwise_features[split_name]
+        )
+        m = compute_ranking_metrics(y, scores, rank_k)
+        setattr(result, f"{split_name}_metrics", m)
+        logger.info(format_ranking_metrics(m, f"{name} — {split_name}"))
+
+    c2i = gnn_data.concept_to_idx
+
+    def _gnn_predict(df, X, _t=trainer, _c2i=c2i):
+        vp = np.array(
+            [
+                [_c2i.get(a, 0), _c2i.get(b, 0)]
+                for a, b in zip(df["concept_a"], df["concept_b"])
+            ],
+            dtype=np.int64,
+        )
+        return _t.predict(vp, X)
+
+    result.predict_fn = _gnn_predict
+
+    df_test = gnn_data.df_test
+    test_pairs = list(zip(df_test["concept_a"], df_test["concept_b"]))
+    test_scores = trainer.predict(
+        gnn_data.vertex_pairs["test"], gnn_data.pairwise_features["test"]
+    )
+    result.top_pairs = get_top_k_pairs(test_pairs, y_test, test_scores, k=10).to_dict(
+        "records"
+    )
+
+    if model_dir is not None:
+        save_path = (
+            model_dir
+            / f"{name.lower().replace(' ', '_').replace('+', '_').replace('(', '').replace(')', '')}.pt"
+        )
+        trainer.save(str(save_path), vars(args))
 
     return result
 
@@ -304,6 +402,14 @@ class TrainingPipeline:
             str(d / self.data_cfg.get("val_file", "val.csv")),
             str(d / self.data_cfg.get("test_file", "ranking_test.csv")),
         )
+    
+    def _graph_path(self) -> Optional[str]:
+        # GNN should use the TRAIN-window graph to avoid data leakage.
+        # Specified under models.gnn.graph_file (not a global data field).
+        g = self.models_cfg.get("gnn", {}).get("graph_file")
+        if g:
+            return str(Path(self.data_cfg["dir"]) / g)
+        return None
 
     def _ranking_csv(self) -> Optional[str]:
         p = self.data_cfg.get("ranking_test_file")
@@ -354,6 +460,54 @@ class TrainingPipeline:
                 self.rank_k,
                 self.model_dir,
             )
+
+        # GNN + MLP (gnn + emb)
+        gnn_cfg = mcfg.get("gnn", {})
+        graph_path = self._graph_path()
+
+        if gnn_cfg.get("enabled", False) and HAS_TORCH_GEOMETRIC:
+            if graph_path is None:
+                logger.warning("GNN skipped: no graph_file in config")
+            else:
+                # emb features
+                try:
+                    split_emb = get_split("emb")
+                    gnn_data_emb = GNNData(split_emb, graph_path)
+                    y_tr = split_emb.train_ds.y.numpy().astype(int)
+                    y_v = split_emb.val_ds.y.numpy().astype(int)
+                    y_te = split_emb.test_ds.y.numpy().astype(int)
+                    results["GNN+MLP (gnn+emb)"] = run_gnn(
+                        "GNN+MLP (gnn+emb)",
+                        gnn_data_emb,
+                        y_tr,
+                        y_v,
+                        y_te,
+                        gnn_cfg,
+                        self.rank_k,
+                        self.model_dir,
+                    )
+                except Exception as e:
+                    logger.warning("GNN+MLP (gnn+emb) failed: %s", e)
+
+                # pairwise = structure + emb features
+                try:
+                    split_struct_emb = get_split(["structure", "emb"])
+                    gnn_data_struct_emb = GNNData(split_struct_emb, graph_path)
+                    y_tr = split_struct_emb.train_ds.y.numpy().astype(int)
+                    y_v = split_struct_emb.val_ds.y.numpy().astype(int)
+                    y_te = split_struct_emb.test_ds.y.numpy().astype(int)
+                    results["GNN+MLP (gnn+struct+emb)"] = run_gnn(
+                        "GNN+MLP (gnn+struct+emb)",
+                        gnn_data_struct_emb,
+                        y_tr,
+                        y_v,
+                        y_te,
+                        gnn_cfg,
+                        self.rank_k,
+                        self.model_dir,
+                    )
+                except Exception as e:
+                    logger.warning("GNN+MLP (gnn+struct+emb) failed: %s", e)
 
         # LightGBM (all)
         if mcfg.get("lightgbm_all", {}).get("enabled", True):
@@ -422,12 +576,23 @@ class TrainingPipeline:
         ("XGBoost (all)", "xgboost_all", "xgb", "all"),
     ]
 
+    _GNN_REGISTRY = [
+        ("GNN+MLP (gnn+emb)", "gnn_mlp_gnn_emb", "emb"),
+        ("GNN+MLP (gnn+struct+emb)", "gnn_mlp_gnn_struct_emb", ["structure", "emb"]),
+    ]
+
     def _build_cache(self) -> Dict[str, DataSplit]:
         """Re-fit scalers for every unique feature group that has an enabled model."""
         train_path, val_path, test_path = self._paths()
         needed_groups: set = set()
         for _, stem, _, fg in self._MODEL_REGISTRY:
             if self.models_cfg.get(stem, {}).get("enabled", True):
+                needed_groups.add(
+                    json.dumps(fg, sort_keys=True) if isinstance(fg, list) else fg
+                )
+        gnn_enabled = self.models_cfg.get("gnn", {}).get("enabled", False)
+        if gnn_enabled and HAS_TORCH_GEOMETRIC:
+            for _, _, fg in self._GNN_REGISTRY:
                 needed_groups.add(
                     json.dumps(fg, sort_keys=True) if isinstance(fg, list) else fg
                 )
@@ -482,8 +647,56 @@ class TrainingPipeline:
                 results[name] = res
                 logger.info("Loaded %s <- %s", name, path)
 
-        return results
+        # Load GNN models if enabled and cache is available
+        gnn_cfg = self.models_cfg.get("gnn", {})
+        graph_path = self._graph_path()
+        if (
+            gnn_cfg.get("enabled", False)
+            and HAS_TORCH_GEOMETRIC
+            and cache
+            and graph_path
+        ):
+            for name, stem, fg in self._GNN_REGISTRY:
+                path = self.model_dir / f"{stem}.pt"
+                if not path.exists():
+                    logger.warning("No saved GNN model for %s at %s", name, path)
+                    continue
+                fg_key = json.dumps(fg, sort_keys=True) if isinstance(fg, list) else fg
+                split = cache.get(fg_key)
+                if split is None:
+                    logger.warning(
+                        "No cached data split for GNN %s (fg=%s) — skipping", name, fg
+                    )
+                    continue
+                try:
+                    gnn_data = GNNData(split, graph_path)
+                    trainer = GNNTrainer.load(
+                        str(path), gnn_data.graph, gnn_data.node_features
+                    )
+                    c2i = gnn_data.concept_to_idx
 
+                    def _make_gnn_fn(t, c):
+                        def fn(df, X):
+                            vp = np.array(
+                                [
+                                    [c.get(a, 0), c.get(b, 0)]
+                                    for a, b in zip(df["concept_a"], df["concept_b"])
+                                ],
+                                dtype=np.int64,
+                            )
+                            return t.predict(vp, X)
+
+                        return fn
+
+                    res = ModelResult(name=name)
+                    res.predict_fn = _make_gnn_fn(trainer, c2i)
+                    results[name] = res
+                    logger.info("Loaded GNN %s <- %s", name, path)
+                except Exception as exc:
+                    logger.warning("Failed to load GNN %s: %s", name, exc)
+
+        return results
+    
     def rank(self, results: Optional[Dict[str, ModelResult]] = None) -> None:
         if not self.do_ranking:
             logger.info("Ranking evaluation disabled")
@@ -519,6 +732,10 @@ class TrainingPipeline:
 
         scaler_map: Dict[str, Any] = {}
         for name, _, _, fg in self._MODEL_REGISTRY:
+            key = _cache_key(fg)
+            if key in cache:
+                scaler_map[name] = cache[key].scaler
+        for name, _, fg in self._GNN_REGISTRY:
             key = _cache_key(fg)
             if key in cache:
                 scaler_map[name] = cache[key].scaler
