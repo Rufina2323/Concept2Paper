@@ -15,7 +15,7 @@ models:
 
   # MLP — graph-topology (structure) features only
   mlp_structure:
-    enabled: true
+    enabled: false
     seed: 42
     loss: "bpr"
     hidden_dims: [128, 64, 32]
@@ -28,7 +28,7 @@ models:
 
   # MLP — sentence-embedding pair features (emb_* columns)
   mlp_emb:
-    enabled: true
+    enabled: false
     seed: 42
     loss: "bpr"
     hidden_dims: [256, 128, 64]
@@ -41,7 +41,7 @@ models:
 
   # MLP — graph-topology with sentence-embedding features (structure + emb)
   mlp_all:
-    enabled: true
+    enabled: false
     seed: 42
     loss: "bpr"
     hidden_dims: [256, 128, 64]
@@ -54,7 +54,7 @@ models:
 
   # 7. LightGBM — all features, LambdaRank
   lightgbm_all:
-    enabled: true
+    enabled: false
     n_estimators: 500
     learning_rate: 0.02
     max_depth: 6
@@ -65,9 +65,23 @@ models:
     early_stopping_rounds: 30
     n_jobs: 1
 
+  # GNN + MLP
+  gnn:
+    enabled: true
+    loss: "bpr"
+    graph_file: "graph_2017_2022.pkl"   # train-window graph only
+    embedding_dim: 64
+    dnn_hidden_dim: 128
+    gnn_dropout_rate: 0.3
+    dnn_dropout_rate: 0.3
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    epochs: 100
+    patience: 10
+
   # 8. XGBoost — all features, rank:ndcg
   xgboost_all:
-    enabled: true
+    enabled: false
     n_estimators: 500
     learning_rate: 0.02
     max_depth: 6

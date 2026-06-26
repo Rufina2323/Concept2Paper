@@ -185,3 +185,159 @@ def load_datasets(
         df_test=df_test,
         feature_cols=cols,
     )
+
+
+class GNNData:
+    """
+    Loads a networkx Graph pkl (created by create_concept_datasets.py) and prepares everything needed for GNN link prediction:
+      - PyG Data object (edge_index + self-loops)
+      - log-normalised degree node features  [N, 1]
+      - vertex-pair integer indices per split
+      - pairwise feature arrays (taken from the DataSplit already provided)
+
+    Args:
+        data_split  : DataSplit returned by load_datasets() for the pairwise features
+        graph_path  : path to the graph_{start}_{end}.pkl networkx Graph file
+    """
+
+    def __init__(self, data_split: DataSplit, graph_path: str):
+        from torch_geometric.data import Data
+        from torch_geometric.utils import add_self_loops
+
+        # Load nx.Graph
+        with open(graph_path, "rb") as f:
+            G: nx.Graph = pickle.load(f)
+        logger.info(
+            "Loaded graph: %d nodes, %d edges", G.number_of_nodes(), G.number_of_edges()
+        )
+
+        # Build concept -> integer index from graph nodes
+        # (restrict to concepts that actually appear in the datasets)
+        all_concepts: set = set(G.nodes())
+        for split_df in (data_split.df_train, data_split.df_val, data_split.df_test):
+            all_concepts.update(split_df["concept_a"].tolist())
+            all_concepts.update(split_df["concept_b"].tolist())
+        concepts = sorted(all_concepts)
+        self.concept_to_idx: Dict[str, int] = {c: i for i, c in enumerate(concepts)}
+        n_nodes = len(concepts)
+        self.num_vertices = n_nodes
+
+        # Build PyG edge_index + edge_attr
+        # edge_attr columns: [log_weight, log_common_neighbors, resource_allocation]
+        node_degree = np.zeros(n_nodes, dtype=np.float32)
+        rows, cols_arr = [], []
+        raw_weights: list = []
+
+        # Build neighbor sets for structural edge features
+        g_neighbors: dict = {c: set() for c in concepts}
+        for u, v in G.edges():
+            iu = self.concept_to_idx.get(u, -1)
+            iv = self.concept_to_idx.get(v, -1)
+            if iu >= 0 and iv >= 0 and iu != iv:
+                rows += [iu, iv]
+                cols_arr += [iv, iu]
+                w = float(G[u][v].get("weight", 1.0))
+                raw_weights += [w, w]
+                node_degree[iu] += 1
+                node_degree[iv] += 1
+                g_neighbors[u].add(v)
+                g_neighbors[v].add(u)
+
+        if rows:
+            src = torch.tensor(rows, dtype=torch.long)
+            dst = torch.tensor(cols_arr, dtype=torch.long)
+        else:
+            src = dst = torch.zeros(0, dtype=torch.long)
+
+        # Compute edge structural features (only for actual graph edges)
+        ea_rows: list = []
+        edge_list = list(G.edges())
+        for u, v in edge_list:
+            iu = self.concept_to_idx.get(u, -1)
+            iv = self.concept_to_idx.get(v, -1)
+            if iu < 0 or iv < 0 or iu == iv:
+                continue
+            nb_u = g_neighbors[u]
+            nb_v = g_neighbors[v]
+            common = nb_u & nb_v
+            cn = len(common)
+            ra = sum(1.0 / max(len(g_neighbors[z]), 1) for z in common)
+            w = float(G[u][v].get("weight", 1.0))
+            ea_rows += [[w, float(cn), ra], [w, float(cn), ra]]  # bidirectional
+
+        if ea_rows:
+            ea_arr = np.array(ea_rows, dtype=np.float32)
+            for col in range(ea_arr.shape[1]):
+                col_max = ea_arr[:, col].max()
+                if col_max > 0:
+                    ea_arr[:, col] = np.log1p(ea_arr[:, col]) / np.log1p(col_max)
+            edge_attr = torch.from_numpy(ea_arr)
+        else:
+            edge_attr = torch.zeros((0, 3), dtype=torch.float32)
+
+        edge_index = (
+            torch.stack([src, dst], dim=0)
+            if rows
+            else torch.zeros((2, 0), dtype=torch.long)
+        )
+
+        # Self-loops: fill edge_attr with 1.0 (maximum weight, no common neighbors applies)
+        edge_index, edge_attr = add_self_loops(
+            edge_index, edge_attr=edge_attr, fill_value=1.0, num_nodes=n_nodes
+        )
+        self.graph = Data(edge_index=edge_index, edge_attr=edge_attr, num_nodes=n_nodes)
+        self.num_edge_features: int = edge_attr.shape[1]  # 3
+
+        # Node features: [log-degree, log-freq]  [N, 2]
+        max_deg = node_degree.max()
+        deg_feat = np.log1p(node_degree) / np.log1p(max(max_deg, 1.0))
+
+        node_freq = np.array(
+            [
+                float(G.nodes[c].get("freq", 0)) if G.has_node(c) else 0.0
+                for c in concepts
+            ],
+            dtype=np.float32,
+        )
+        max_freq = node_freq.max()
+        freq_feat = np.log1p(node_freq) / np.log1p(max(max_freq, 1.0))
+
+        nf = np.stack([deg_feat, freq_feat], axis=1).astype(np.float32)
+        self.node_features = torch.from_numpy(nf)
+        self.num_node_features = 2
+
+        # Per-split vertex pairs + pairwise features
+        self.vertex_pairs: Dict[str, np.ndarray] = {}
+        self.pairwise_features: Dict[str, np.ndarray] = {}
+
+        for split, df, ds in (
+            ("train", data_split.df_train, data_split.train_ds),
+            ("val", data_split.df_val, data_split.val_ds),
+            ("test", data_split.df_test, data_split.test_ds),
+        ):
+            a_idx = (
+                df["concept_a"]
+                .map(self.concept_to_idx)
+                .fillna(0)
+                .astype(np.int64)
+                .values
+            )
+            b_idx = (
+                df["concept_b"]
+                .map(self.concept_to_idx)
+                .fillna(0)
+                .astype(np.int64)
+                .values
+            )
+            self.vertex_pairs[split] = np.stack([a_idx, b_idx], axis=1)
+            self.pairwise_features[split] = ds.X.numpy()  # already scaled
+
+        self.df_test = data_split.df_test
+
+        self.num_pairwise_features = self.pairwise_features["train"].shape[1]
+        logger.info(
+            "GNNData ready — nodes: %d, node_feat: %d, pairwise_feat: %d",
+            n_nodes,
+            self.num_node_features,
+            self.num_pairwise_features,
+        )
